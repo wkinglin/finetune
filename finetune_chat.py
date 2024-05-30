@@ -1,29 +1,46 @@
 # This code is based on the revised code from fastchat based on tatsu-lab/stanford_alpaca.
 
 
-from dataclasses import dataclass, field
+
 import json
 import math
 import logging
 import os
-from typing import Dict, Optional, List
 import torch
-from torch.utils.data import Dataset
+import transformers
 from deepspeed import zero
 from deepspeed.runtime.zero.partition_parameters import ZeroParamStatus
-import transformers
+from dataclasses import dataclass, field
+from torch.utils.data import Dataset
+from typing import Dict, Optional, List
 from transformers import Trainer, GPTQConfig, deepspeed
 from transformers.trainer_pt_utils import LabelSmoother
 from peft import LoraConfig, get_peft_model, prepare_model_for_kbit_training
 from accelerate.utils import DistributedType
-from typing import Any, Callable, Dict, List, NewType, Optional, Tuple, Union
-from dataclasses import dataclass
+from typing import (
+    Any, 
+    Callable, 
+    NewType, 
+    Optional, 
+    Tuple, 
+    AbstractSet,
+    cast,
+    Collection,
+    Dict,
+    Iterator,
+    List,
+    Literal,
+    Sequence,
+    TypedDict,
+    Union,
+)
+
 IGNORE_TOKEN_ID = LabelSmoother.ignore_index
 
 
 @dataclass
 class ModelArguments:
-    model_name_or_path: Optional[str] = field(default="Qwen/Qwen-7B")
+    model_name_or_path: Optional[str] = field(default="/mnt/public/algm/models/Qwen1.5-7B")
     model_type: str = field(
         default="Qwen", metadata={"help": "Qwen or llama3"}
     )
@@ -66,6 +83,16 @@ class LoraArguments:
     q_lora: bool = False
 
 
+Role = Literal["system", "user", "assistant"]
+
+class Message(TypedDict):
+    role: Role
+    content: str
+
+
+Dialog = Sequence[Message]
+
+# DeepSpeed ZeRO 优化模型训练内存
 def maybe_zero_3(param):
     if hasattr(param, "ds_id"):
         assert param.ds_status == ZeroParamStatus.NOT_AVAILABLE
@@ -75,7 +102,7 @@ def maybe_zero_3(param):
         param = param.detach().cpu().clone()
     return param
 
-
+# 部分错误修改
 # Borrowed from peft.utils.get_peft_model_state_dict
 def get_peft_state_maybe_zero_3(named_params, bias):
     if bias == "none":
@@ -94,8 +121,8 @@ def get_peft_state_maybe_zero_3(named_params, bias):
             elif "bias" in k:
                 maybe_lora_bias[k] = t
         for k, t in maybe_lora_bias:
-            if bias_name in lora_bias_names:
-                to_return[bias_name] = t
+            if k in lora_bias_names:
+                to_return[k] = t
     else:
         raise NotImplementedError
     to_return = {k: maybe_zero_3(v) for k, v in to_return.items()}
@@ -125,24 +152,18 @@ def safe_save_model_for_hf_trainer(trainer: transformers.Trainer, output_dir: st
         trainer._save(output_dir, state_dict=state_dict)
 
 
-def preprocess(
+# sources:[{"from":"user", "value": "...."}, {"from":"assistant", "value": "...."}]
+
+def preprocess_Qwen(
     sources,
     tokenizer: transformers.PreTrainedTokenizer,
     max_len: int,
     system_message: str = "You are a helpful assistant."
 ) -> Dict:
-    #Qwen
     roles = {"user": "<|im_start|>user", "assistant": "<|im_start|>assistant"}
-    #llama3
-    #roles = {"user": "<|start_header_id|>user", "assistant": "<|start_header_id|>assistant"}
-    #Qwen
+
     im_start = tokenizer.im_start_id
     im_end = tokenizer.im_end_id
-
-    #llama3
-    #im_start = tokenizer.bos_token_id
-    #im_end = tokenizer.eos_token_id
-    
     
     nl_tokens = tokenizer('\n').input_ids
     _system = tokenizer('system').input_ids + nl_tokens
@@ -158,29 +179,34 @@ def preprocess(
         input_id, target = [], []
         system = [im_start] + _system + tokenizer(system_message).input_ids + [im_end] + nl_tokens
         input_id += system
+        # system全部忽略
         target += [im_start] + [IGNORE_TOKEN_ID] * (len(system)-3) + [im_end] + nl_tokens
         assert len(input_id) == len(target)
+
         for j, sentence in enumerate(source):
             role = roles[sentence["from"]]
             _input_id = tokenizer(role).input_ids + nl_tokens + \
                 tokenizer(sentence["value"]).input_ids + [im_end] + nl_tokens
             input_id += _input_id
-            if role == '<|start_header_id|>user':
+            # user全部忽略
+            if role == '<|im_start|>user':
                 _target = [im_start] + [IGNORE_TOKEN_ID] * (len(_input_id)-3) + [im_end] + nl_tokens
-            elif role == '<|start_header_id|>assistant':
+            # assistant答案只保留句子
+            elif role == '<|im_start|>assistant':
                 _target = [im_start] + [IGNORE_TOKEN_ID] * len(tokenizer(role).input_ids) + \
                     _input_id[len(tokenizer(role).input_ids)+1:-2] + [im_end] + nl_tokens
             else:
                 raise NotImplementedError
             target += _target
         assert len(input_id) == len(target)
+
         input_id += [tokenizer.pad_token_id] * (max_len - len(input_id))
         target += [IGNORE_TOKEN_ID] * (max_len - len(target))
         input_ids.append(input_id[:max_len])
         targets.append(target[:max_len])
     input_ids = torch.tensor(input_ids, dtype=torch.int)
     targets = torch.tensor(targets, dtype=torch.int)
-
+    
     return dict(
         input_ids=input_ids,
         labels=targets,
@@ -194,19 +220,12 @@ def preprocess_llama3(
     max_len: int,
     system_message: str = "You are a helpful assistant."
 ) -> Dict:
-    #Qwen
-    #roles = {"user": "<|im_start|>user", "assistant": "<|im_start|>assistant"}
-    #llama3
     roles = {"user": "<|start_header_id|>user", "assistant": "<|start_header_id|>assistant"}
-    #Qwen
-    #im_start = tokenizer.im_start_id
-    #im_end = tokenizer.im_end_id
 
-    #llama3
     im_start = tokenizer.bos_token_id
     im_end = tokenizer.eos_token_id
     
-    
+    # llama3中 nl_tokens长度为2，所以要-4
     nl_tokens = tokenizer('\n').input_ids
     _system = tokenizer('system').input_ids + nl_tokens
     _user = tokenizer('user').input_ids + nl_tokens
@@ -223,20 +242,18 @@ def preprocess_llama3(
         input_id += system
         target += [im_start] + [IGNORE_TOKEN_ID] * (len(system)-4) + [im_end] + nl_tokens
         assert len(input_id) == len(target)
+
         for j, sentence in enumerate(source):
             role = roles[sentence["from"]]
-            _input_id = tokenizer(role).input_ids + nl_tokens + \
-                tokenizer(sentence["value"]).input_ids + [im_end] + nl_tokens
+            _input_id = tokenizer(role).input_ids + nl_tokens + tokenizer(sentence["value"]).input_ids + [im_end] + nl_tokens
             input_id += _input_id
             if role == '<|start_header_id|>user':
                 _target = [im_start] + [IGNORE_TOKEN_ID] * (len(_input_id)-4) + [im_end] + nl_tokens
             elif role == '<|start_header_id|>assistant':
-                # _target = [im_start] + [IGNORE_TOKEN_ID] * len(tokenizer(role).input_ids) + \
-                #     _input_id[len(tokenizer(role).input_ids)+1:-3] + [im_end] + nl_tokens
-                _target = [im_start] + [IGNORE_TOKEN_ID] * (len(tokenizer(role).input_ids ) + 1) + \
-                    _input_id[len(tokenizer(role).input_ids)+2:-3] + [im_end] + nl_tokens
+                _target = [im_start] + [IGNORE_TOKEN_ID] * len(tokenizer(role).input_ids) + _input_id[len(tokenizer(role).input_ids)+1:-3] + [im_end] + nl_tokens
             else:
                 raise NotImplementedError
+            
             target += _target
         assert len(input_id) == len(target)
         input_id += [tokenizer.pad_token_id] * (max_len - len(input_id))
@@ -252,28 +269,6 @@ def preprocess_llama3(
         attention_mask=input_ids.ne(tokenizer.pad_token_id),
         pad_token_id = tokenizer.pad_token_id,
     )
-
-from typing import (
-    AbstractSet,
-    cast,
-    Collection,
-    Dict,
-    Iterator,
-    List,
-    Literal,
-    Sequence,
-    TypedDict,
-    Union,
-)
-Role = Literal["system", "user", "assistant"]
-
-
-class Message(TypedDict):
-    role: Role
-    content: str
-
-
-Dialog = Sequence[Message]
 
 def preprocess_newllama3(
     sources,
@@ -296,6 +291,7 @@ def preprocess_newllama3(
         )
         tokens.append(tokenizer.special_tokens["<|eot_id|>"])
         return tokens
+    
     def encode_dialog_prompt(tokenizer, dialog: Dialog) -> List[int]:
         tokens = []
         tokens.append(tokenizer.special_tokens["<|begin_of_text|>"])
@@ -305,7 +301,7 @@ def preprocess_newllama3(
         tokens.extend(encode_header({"role": "assistant", "content": ""}))
         return tokens
     
-    _system_ids = tokenizer.encode("You are a pirate chatbot who always responds in pirate speak!",add_special_tokens=False)
+    _system_ids = tokenizer.encode(system_message, add_special_tokens=False)
 
     # Apply prompt templates
     input_ids, targets = [], []
@@ -382,12 +378,16 @@ def preprocess_newllama3(
 class SupervisedDataset(Dataset):
     """Dataset for supervised fine-tuning."""
 
-    def __init__(self, raw_data, tokenizer: transformers.PreTrainedTokenizer, max_len: int):
+    def __init__(self, raw_data, tokenizer: transformers.PreTrainedTokenizer, max_len: int, model_type: str):
         super(SupervisedDataset, self).__init__()
 
         rank0_print("Formatting inputs...")
         sources = [example["conversations"] for example in raw_data]
-        data_dict = preprocess(sources, tokenizer, max_len)
+
+        if model_type =="Qwen":
+            data_dict = preprocess_Qwen(sources, tokenizer, max_len)
+        else:
+            data_dict = preprocess_newllama3(sources, tokenizer, max_len)
 
         self.input_ids = data_dict["input_ids"]
         self.labels = data_dict["labels"]
@@ -403,42 +403,31 @@ class SupervisedDataset(Dataset):
             attention_mask=self.attention_mask[i],
         )
 
-
 class LazySupervisedDataset(Dataset):
     """Dataset for supervised fine-tuning."""
 
-    def __init__(self, raw_data, tokenizer: transformers.PreTrainedTokenizer, max_len: int):
+    def __init__(self, raw_data, tokenizer: transformers.PreTrainedTokenizer, max_len: int, model_type: str):
         super(LazySupervisedDataset, self).__init__()
         self.tokenizer = tokenizer
         self.max_len = max_len
+        self.model_type = model_type
 
         rank0_print("Formatting inputs...Skip in lazy mode")
-        self.tokenizer = tokenizer
         self.raw_data = raw_data
         self.cached_data_dict = {}
         print(f"--------[init LazySupervisedDataset]")
+        
     def __len__(self):
         return len(self.raw_data)
 
-    # def __getitem__(self, i) -> Dict[str, torch.Tensor]:
-    #     if i in self.cached_data_dict:
-    #         return self.cached_data_dict[i]
-    #     #print(f"-------- 正在处理第 [{i}]条",flush=True)
-    #     # ret = preprocess([self.raw_data[i]["conversations"]], self.tokenizer, self.max_len)
-    #     # ret = dict(
-    #     #     input_ids=ret["input_ids"][0],
-    #     #     labels=ret["labels"][0],
-    #     #     attention_mask=ret["attention_mask"][0],
-    #     # )
-    #     # self.cached_data_dict[i] = ret
-
-    #     ret = self.raw_data[i]["conversations"]
-    #     return ret
     def __getitem__(self, i) -> Dict[str, torch.Tensor]:
         if i in self.cached_data_dict:
             return self.cached_data_dict[i]
         #print(f"-------- 正在处理第 [{i}]条",flush=True)
-        ret = preprocess_newllama3([self.raw_data[i]["conversations"]], self.tokenizer, self.max_len)
+        if self.model_type =="Qwen":
+            ret = preprocess_Qwen([self.raw_data[i]["conversations"]], self.tokenizer, self.max_len)
+        else:
+            ret = preprocess_newllama3([self.raw_data[i]["conversations"]], self.tokenizer, self.max_len)
 
         #print(f"---_getitem_ {i} {ret}")
 
@@ -451,46 +440,13 @@ class LazySupervisedDataset(Dataset):
         self.cached_data_dict[i] = ret
 
         return ret
-# def torch_default_data_collator(features: List[InputDataClass]) -> Dict[str, Any]:
-#     import torch
-
-#     if not isinstance(features[0], Mapping):
-#         features = [vars(f) for f in features]
-#     first = features[0]
-#     batch = {}
-
-#     # Special handling for labels.
-#     # Ensure that tensor is created with the correct type
-#     # (it should be automatically the case, but let's make sure of it.)
-#     if "label" in first and first["label"] is not None:
-#         label = first["label"].item() if isinstance(first["label"], torch.Tensor) else first["label"]
-#         dtype = torch.long if isinstance(label, int) else torch.float
-#         batch["labels"] = torch.tensor([f["label"] for f in features], dtype=dtype)
-#     elif "label_ids" in first and first["label_ids"] is not None:
-#         if isinstance(first["label_ids"], torch.Tensor):
-#             batch["labels"] = torch.stack([f["label_ids"] for f in features])
-#         else:
-#             dtype = torch.long if type(first["label_ids"][0]) is int else torch.float
-#             batch["labels"] = torch.tensor([f["label_ids"] for f in features], dtype=dtype)
-
-#     # Handling of all other possible keys.
-#     # Again, we will use the first element to figure out which key/values are not None for this model.
-#     for k, v in first.items():
-#         if k not in ("label", "label_ids") and v is not None and not isinstance(v, str):
-#             if isinstance(v, torch.Tensor):
-#                 batch[k] = torch.stack([f[k] for f in features])
-#             elif isinstance(v, np.ndarray):
-#                 batch[k] = torch.tensor(np.stack([f[k] for f in features]))
-#             else:
-#                 batch[k] = torch.tensor([f[k] for f in features])
-
-#     return batch
-class data_collator_withbatchmaxlength:
     
 
+class data_collator_withbatchmaxlength:
     tokenizer: transformers.AutoTokenizer  
     max_length: Optional[int] = None
     return_tensors: str = "pt"
+
     def __init__(
         self,
         tokenizer: transformers.AutoTokenizer,
@@ -514,7 +470,6 @@ class data_collator_withbatchmaxlength:
 
         # print(f"{self.tokenizer.pad_token_id}")
         # os._exit(0)
-
        
         # if "label" in batch:
         #     batch["labels"] = batch["label"]
@@ -525,7 +480,6 @@ class data_collator_withbatchmaxlength:
         
         #print(f"features ------- {features}")
         batch = transformers.default_data_collator(features, self.return_tensors)
-        #print(f"zzzzzzzzzz",flush=True)
         #print(f"batch ------- {batch}")
         batch['input_ids'] = batch['input_ids'].to(torch.long)
         batch['labels'] = batch['labels'].to(torch.long)
@@ -551,6 +505,7 @@ class data_collator_withbatchmaxlength:
         #print(f"new batch --- {batch}")
         #os._exit(0)
         return batch
+    
 # def data_collator_paddingwithbatchmaxlength(features: list) -> dict:
 #     print(f"=======len [{len(features)}]")
 
@@ -586,66 +541,6 @@ class data_collator_withbatchmaxlength:
 #         "input_ids": input_ids,
 #         "labels": labels,
 #     }
-
-def make_supervised_data_module(
-    tokenizer: transformers.PreTrainedTokenizer, data_args, max_len,
-) -> Dict:
-    """Make dataset and collator for supervised fine-tuning."""
-    dataset_cls = (
-        LazySupervisedDataset if data_args.lazy_preprocess else SupervisedDataset
-    )
-    rank0_print("Loading data...")
-
-    # train_json = json.load(open(data_args.data_path, "r"))
-    # train_dataset = dataset_cls(train_json, tokenizer=tokenizer, max_len=max_len)
-
-    train_data = []
-    with open(data_args.data_path, "r") as f:
-        for line in f:
-            train_data.append(json.loads(line))
-            # json_d = json.loads(line)
-            # d = []
-            # for dx in json_d['conversations']:
-            #     if dx['role'] in ["user","assistant"]:
-            #         d.append({"from":dx['role'], "value":dx['content']})
-            # train_data.append({"conversations": d})
-    print(f"本次SFT数据条数： {len(train_data)}")
-    train_dataset = dataset_cls(train_data, tokenizer=tokenizer, max_len=max_len)
-
-    if data_args.eval_data_path:
-        eval_json = json.load(open(data_args.eval_data_path, "r"))
-        eval_dataset = dataset_cls(eval_json, tokenizer=tokenizer, max_len=max_len)
-    else:
-        eval_dataset = None
-
-    return dict(train_dataset=train_dataset, eval_dataset=eval_dataset)
-
-def make_supervised_data_module_debug(
-    tokenizer: transformers.PreTrainedTokenizer, data_args, max_len,
-) -> Dict:
-    """Make dataset and collator for supervised fine-tuning."""
-    dataset_cls = (
-        LazySupervisedDataset if True else SupervisedDataset
-    )
-    rank0_print("Loading data...")
-
-    # train_json = json.load(open(data_args.data_path, "r"))
-    # train_dataset = dataset_cls(train_json, tokenizer=tokenizer, max_len=max_len)
-
-    train_data = []
-    with open('/mnt/public/xuhaiyang/SFT_DATA/merge_files/shuati_core_tiny.jsonl', "r") as f:
-        for line in f:
-            train_data.append(json.loads(line))
-            # json_d = json.loads(line)
-            # d = []
-            # for dx in json_d['conversations']:
-            #     if dx['role'] in ["user","assistant"]:
-            #         d.append({"from":dx['role'], "value":dx['content']})
-            # train_data.append({"conversations": d})
-    print(f"本次SFT数据条数： {len(train_data)}")
-    train_dataset = dataset_cls(train_data, tokenizer=tokenizer, max_len=max_len)
-    print(f"----------[{train_dataset[0]}]")
-    return dict(train_dataset=train_dataset, eval_dataset=None)
 
 def user_pad_without_fast_tokenizer_warning(tokenizer, *pad_args, **pad_kwargs):
     """
@@ -725,7 +620,66 @@ class user_DataCollatorWithPadding:
         print(f"features {features}")
         print(f"batch {batch}")
         return batch
-    
+
+def make_supervised_data_module(
+    tokenizer: transformers.PreTrainedTokenizer, data_args, max_len,
+) -> Dict:
+    """Make dataset and collator for supervised fine-tuning."""
+    dataset_cls = (
+        LazySupervisedDataset if data_args.lazy_preprocess else SupervisedDataset
+    )
+    rank0_print("Loading data...")
+
+    # train_json = json.load(open(data_args.data_path, "r"))
+    # train_dataset = dataset_cls(train_json, tokenizer=tokenizer, max_len=max_len)
+
+    train_data = []
+    with open(data_args.data_path, "r") as f:
+        for line in f:
+            train_data.append(json.loads(line))
+            # json_d = json.loads(line)
+            # d = []
+            # for dx in json_d['conversations']:
+            #     if dx['role'] in ["user","assistant"]:
+            #         d.append({"from":dx['role'], "value":dx['content']})
+            # train_data.append({"conversations": d})
+    print(f"本次SFT数据条数： {len(train_data)}")
+    train_dataset = dataset_cls(train_data, tokenizer=tokenizer, max_len=max_len)
+
+    if data_args.eval_data_path:
+        eval_json = json.load(open(data_args.eval_data_path, "r"))
+        eval_dataset = dataset_cls(eval_json, tokenizer=tokenizer, max_len=max_len)
+    else:
+        eval_dataset = None
+
+    return dict(train_dataset=train_dataset, eval_dataset=eval_dataset)
+
+def make_supervised_data_module_debug(
+    tokenizer: transformers.PreTrainedTokenizer, data_args, max_len,
+) -> Dict:
+    """Make dataset and collator for supervised fine-tuning."""
+    dataset_cls = (
+        LazySupervisedDataset if True else SupervisedDataset
+    )
+    rank0_print("Loading data...")
+
+    # train_json = json.load(open(data_args.data_path, "r"))
+    # train_dataset = dataset_cls(train_json, tokenizer=tokenizer, max_len=max_len)
+
+    train_data = []
+    with open('/mnt/public/xuhaiyang/SFT_DATA/merge_files/shuati_core_tiny.jsonl', "r") as f:
+        for line in f:
+            train_data.append(json.loads(line))
+            # json_d = json.loads(line)
+            # d = []
+            # for dx in json_d['conversations']:
+            #     if dx['role'] in ["user","assistant"]:
+            #         d.append({"from":dx['role'], "value":dx['content']})
+            # train_data.append({"conversations": d})
+    print(f"本次SFT数据条数： {len(train_data)}")
+    train_dataset = dataset_cls(train_data, tokenizer=tokenizer, max_len=max_len)
+    print(f"----------[{train_dataset[0]}]")
+    return dict(train_dataset=train_dataset, eval_dataset=None)
 
 def train():
     global local_rank
@@ -791,6 +745,7 @@ def train():
         else None,
         **model_load_kwargs,
     )
+
     tokenizer = transformers.AutoTokenizer.from_pretrained(
         model_args.model_name_or_path,
         cache_dir=training_args.cache_dir,
@@ -799,10 +754,11 @@ def train():
         use_fast=False,
         trust_remote_code=True,
     )
-    if model_args.model_type == "llama3":
-        tokenizer.pad_token_id = tokenizer.eos_token_id
-    else:
+
+    if model_args.model_type == "Qwen":
         tokenizer.pad_token_id = tokenizer.eod_id
+    else:
+        tokenizer.pad_token_id = tokenizer.eos_token_id
 
     if training_args.use_lora:
         if lora_args.q_lora or is_chat_model:
@@ -835,21 +791,17 @@ def train():
     data_module = make_supervised_data_module(
         tokenizer=tokenizer, data_args=data_args, max_len=training_args.model_max_length
     )
+
     data_collator_user = data_collator_withbatchmaxlength(tokenizer,
 						   								 max_length=512,
 						   								 return_tensors="pt")
+    
     test_data_collator = user_DataCollatorWithPadding(tokenizer, 
 						   								 padding="max_length",
 						   								 max_length=512,
 						   								 return_tensors="pt")
 
-
     # Start trainner
-    # trainer = Trainer(
-    #     model=model, tokenizer=tokenizer, args=training_args, **data_module
-    # )
-
-    # # Start trainner
     trainer = Trainer(
         model=model, tokenizer=tokenizer, args=training_args, **data_module, data_collator = data_collator_user
     )
@@ -861,26 +813,30 @@ def train():
 
 def train_debug():
     print("=============haha start!!!!")
+
+    parser = transformers.HfArgumentParser(
+        (ModelArguments, DataArguments, TrainingArguments, LoraArguments)
+    )
+    (
+        model_args,
+        data_args,
+        training_args,
+        lora_args,
+    ) = parser.parse_args_into_dataclasses()
     
     tokenizer = transformers.AutoTokenizer.from_pretrained(
-        '/mnt/public/xuhaiyang/model_zoo/Meta-Llama-3-8B/',
+        model_args.model_name_or_path,
         cache_dir=None,
-        model_max_length=4096,
+        model_max_length=training_args.model_max_length,
         padding_side="right",
         use_fast=False,
         trust_remote_code=True,
     )
 
-
-    # tokenizer = transformers.AutoTokenizer.from_pretrained(
-    #     '/mnt/public/xuhaiyang/model_zoo/Qwen-7B/',
-    #     cache_dir=None,
-    #     model_max_length=4096,
-    #     padding_side="right",
-    #     use_fast=False,
-    #     trust_remote_code=True,
-    # )
-    tokenizer.pad_token_id = tokenizer.eos_token_id
+    if model_args.model_type == "Qwen":
+        tokenizer.pad_token_id = tokenizer.eod_id
+    else:
+        tokenizer.pad_token_id = tokenizer.eos_token_id
 
     # if training_args.use_lora:
     #     if lora_args.q_lora or is_chat_model:
@@ -924,9 +880,6 @@ def train_debug():
     # trainer.save_state()
 
     # safe_save_model_for_hf_trainer(trainer=trainer, output_dir=training_args.output_dir, bias=lora_args.lora_bias)
-
-
-
 
 if __name__ == "__main__":
     train()

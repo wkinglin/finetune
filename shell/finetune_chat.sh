@@ -132,7 +132,6 @@ output_dir='/mnt/public/xuhaiyang/SFT_MODEL/MODEL_20240515_08_59_Meta-Llama-3-8B
 
 
 
-
 MODEL="/mnt/public/algm/models/Qwen1.5-7B"
 DATA='/mnt/public/xuhaiyang/SFT_DATA/merge_files/shuati_core.jsonl'
 output_dir='/mnt/public/jinweilin/SFT_MODEL/MODEL_20240529_Qwen_7B_shuati/'
@@ -150,12 +149,16 @@ DATA='/mnt/public/xuhaiyang/SFT_DATA/merge_files/shuati_core.jsonl'
 output_dir='/mnt/public/jinweilin/SFT_MODEL/MODEL_20240530_Qwen1.5_14B-Chat_shuati/'
 
 MODEL="/mnt/public/algm/models/Meta-Llama-3-8B-Instruct"
-DATA="/mnt/public/jinweilin/code/shuati_core_compress.jsonl"
+DATA="/mnt/public/jinweilin/code/data/shuati_core_compress.jsonl"
 output_dir='/mnt/public/jinweilin/SFT_MODEL/MODEL_20240530_Meta-Llama-3-8B-Instruct_shuati_compress/'
+
+MODEL="/mnt/public/algm/models/Meta-Llama-3-8B-Instruct"
+DATA="/mnt/public/jinweilin/code/data/chat_shuati.jsonl"
+output_dir='/mnt/public/jinweilin/SFT_MODEL/MODEL_20240530_Meta-Llama-3-8B-Instruct_chat_shuati/'
 
 MAX_LENGTH=4096
 NUM_TRAIN_EPOCHS=1
-MODEL_TYPE="llama3"
+MODEL_TYPE="llama3" 
 
 function usage() {
     echo '
@@ -229,4 +232,4 @@ torchrun $DISTRIBUTED_ARGS finetune_chat.py \
     --model_max_length $MAX_LENGTH \
     --gradient_checkpointing True \
     --lazy_preprocess True \
-    --deepspeed finetune/ds_config_zero3.json
+    --deepspeed shell/ds_config_zero3.json
