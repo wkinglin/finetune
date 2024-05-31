@@ -152,9 +152,13 @@ MODEL="/mnt/public/algm/models/Meta-Llama-3-8B-Instruct"
 DATA="/mnt/public/jinweilin/code/data/shuati_core_compress.jsonl"
 output_dir='/mnt/public/jinweilin/SFT_MODEL/MODEL_20240530_Meta-Llama-3-8B-Instruct_shuati_compress/'
 
-MODEL="/mnt/public/algm/models/Meta-Llama-3-8B-Instruct"
-DATA="/mnt/public/jinweilin/code/data/chat_shuati.jsonl"
-output_dir='/mnt/public/jinweilin/SFT_MODEL/MODEL_20240530_Meta-Llama-3-8B-Instruct_chat_shuati/'
+MODEL="/mnt/public/xuhaiyang/model_zoo/Meta-Llama-3-8B-Instruct"
+DATA="/mnt/public/xuhaiyang/SFT_DATA/merge_files/chat_shuati.jsonl"
+output_dir='/mnt/public/xuhaiyang/SFT_MODEL/MODEL_20240531_Meta-Llama-3-8B-Instruct_chat_shuati/'
+
+MODEL="/mnt/public/xuhaiyang/model_zoo/Meta-Llama-3-8B-Instruct"
+DATA="/mnt/public/xuhaiyang/SFT_DATA/merge_files/shuati_core_tiny.jsonl"
+output_dir='/mnt/public/xuhaiyang/SFT_MODEL/MODEL_20240531_Meta-Llama-3-8B-Instruct_chat_shuati/'
 
 MAX_LENGTH=4096
 NUM_TRAIN_EPOCHS=1

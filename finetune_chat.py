@@ -622,7 +622,7 @@ class user_DataCollatorWithPadding:
         return batch
 
 def make_supervised_data_module(
-    tokenizer: transformers.PreTrainedTokenizer, data_args, max_len,
+    tokenizer: transformers.PreTrainedTokenizer, data_args, max_len, model_args
 ) -> Dict:
     """Make dataset and collator for supervised fine-tuning."""
     dataset_cls = (
@@ -635,20 +635,24 @@ def make_supervised_data_module(
 
     train_data = []
     with open(data_args.data_path, "r") as f:
+        value_max_length = 0
         for line in f:
             train_data.append(json.loads(line))
-            # json_d = json.loads(line)
-            # d = []
-            # for dx in json_d['conversations']:
-            #     if dx['role'] in ["user","assistant"]:
-            #         d.append({"from":dx['role'], "value":dx['content']})
-            # train_data.append({"conversations": d})
+    #         json_d = json.loads(line)
+    #         conversations = json_d['conversations']
+    #         for conversation in conversations:
+    #             value_max_length = max(value_max_length, len(conversation['value']))
+
+    # # 减小最长长度  
+    # print(f"value最长长度:{value_max_length}")
+    # print(f"规定最长长度:{max_len}")
+    # max_len = min(max_len,value_max_length)
     print(f"本次SFT数据条数： {len(train_data)}")
-    train_dataset = dataset_cls(train_data, tokenizer=tokenizer, max_len=max_len)
+    train_dataset = dataset_cls(train_data, tokenizer=tokenizer, max_len=max_len, model_type=model_args.model_type)
 
     if data_args.eval_data_path:
         eval_json = json.load(open(data_args.eval_data_path, "r"))
-        eval_dataset = dataset_cls(eval_json, tokenizer=tokenizer, max_len=max_len)
+        eval_dataset = dataset_cls(eval_json, tokenizer=tokenizer, max_len=max_len, model_type=model_args.model_type)
     else:
         eval_dataset = None
 
@@ -789,7 +793,7 @@ def train():
 
     # Load data
     data_module = make_supervised_data_module(
-        tokenizer=tokenizer, data_args=data_args, max_len=training_args.model_max_length
+        tokenizer=tokenizer, data_args=data_args, max_len=training_args.model_max_length, model_args=model_args
     )
 
     data_collator_user = data_collator_withbatchmaxlength(tokenizer,
